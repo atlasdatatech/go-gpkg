@@ -3,17 +3,14 @@ package gpkg
 import (
 	"fmt"
 	"os"
-)
+	"strings"
 
-import (
 	"github.com/jinzhu/gorm"
-	_ "github.com/jinzhu/gorm/dialects/sqlite"
-	"github.com/pkg/errors"
-)
 
-import (
 	"github.com/go-spatial/geom"
 	"github.com/go-spatial/geom/encoding/wkb"
+	_ "github.com/jinzhu/gorm/dialects/sqlite"
+	"github.com/pkg/errors"
 )
 
 type GeoPackage struct {
@@ -64,14 +61,14 @@ func (g *GeoPackage) AutoMigrate() error {
 	if err != nil {
 		return errors.Wrap(err, "Error migrating TileMatrixSet")
 	}
-	err = g.DB.AutoMigrate(Metadata{}).Error
+	err = g.DB.AutoMigrate(Extension{}).Error
 	if err != nil {
-		return errors.Wrap(err, "Error migrating Metadata")
+		return errors.Wrap(err, "Error migrating Extension")
 	}
-	err = g.DB.AutoMigrate(MetadataReference{}).Error
-	if err != nil {
-		return errors.Wrap(err, "Error migrating MetadataReference")
-	}
+	// err = g.DB.AutoMigrate(MetadataReference{}).Error
+	// if err != nil {
+	// 	return errors.Wrap(err, "Error migrating MetadataReference")
+	// }
 	err = g.DB.AutoMigrate(SpatialReferenceSystem{}).Error
 	if err != nil {
 		return errors.Wrap(err, "Error migrating SpatialReferenceSystem")
@@ -351,4 +348,138 @@ func (g *GeoPackage) GetMaxZoom(table string) (int, error) {
 
 func (g *GeoPackage) Close() error {
 	return g.DB.Close()
+}
+
+//AddSpatialIndex ..
+func (g *GeoPackage) AddSpatialIndex(tabelName, geomColumn string) error {
+	//暂时不要触发器，导入完成后在创建rtreeindex
+	stmts := []string{
+		`CREATE TRIGGER \"rtree_%s_%s_insert\"\n"
+			"AFTER INSERT ON \"%s\"\n"
+			"WHEN (new.\"%s\" NOT NULL AND NOT ST_IsEmpty(NEW.\"%s\"))\n"
+			"BEGIN\n"
+			"INSERT OR REPLACE INTO \"rtree_%s_%s\" VALUES (NEW.ROWID, "
+			"ST_MinX(NEW.\"%s\"), ST_MaxX(NEW.\"%s\"), ST_MinY(NEW.\"%s\"), "
+			"ST_MaxY(NEW.\"%s\"));\nEND`,
+
+		`CREATE TRIGGER \"rtree_%s_%s_update1\"\n"
+			"AFTER UPDATE OF \"%s\" ON \"%s\"\n"
+			"WHEN OLD.ROWID = NEW.ROWID AND "
+			"(NEW.\"%s\" NOT NULL AND NOT ST_IsEmpty(NEW.\"%s\"))\n"
+			"BEGIN\n"
+			"INSERT OR REPLACE INTO \"rtree_%s_%s\" VALUES (NEW.ROWID, "
+			"ST_MinX(NEW.\"%s\"), ST_MaxX(NEW.\"%s\"), ST_MinY(NEW.\"%s\"), "
+			"ST_MaxY(NEW.\"%s\"));\nEND`,
+
+		`CREATE TRIGGER \"rtree_%s_%s_update2\"\n"
+			"AFTER UPDATE OF \"%s\" ON \"%s\"\n"
+			"WHEN OLD.ROWID = NEW.ROWID AND "
+			"(NEW.\"%s\" IS NULL OR ST_IsEmpty(NEW.\"%s\"))\n"
+			"BEGIN\n" "DELETE FROM \"rtree_%s_%s\" WHERE id = OLD.ROWID;\nEND`,
+
+		`CREATE TRIGGER \"rtree_%s_%s_update3\"\n"
+			"AFTER UPDATE OF \"%s\" ON \"%s\"\n"
+			"WHEN OLD.ROWID != NEW.ROWID AND "
+			"(NEW.\"%s\" NOT NULL AND NOT ST_IsEmpty(NEW.\"%s\"))\n"
+			"BEGIN\n"
+			"DELETE FROM \"rtree_%s_%s\" WHERE id = OLD.ROWID;\n"
+			"INSERT OR REPLACE INTO \"rtree_%s_%s\" VALUES (NEW.ROWID, "
+			"ST_MinX(NEW.\"%s\"), ST_MaxX(NEW.\"%s\"), ST_MinY(NEW.\"%s\"), "
+			"ST_MaxY(NEW.\"%s\"));\nEND`,
+
+		`CREATE TRIGGER \"rtree_%s_%s_update4\"\n"
+			"AFTER UPDATE ON \"%s\"\n"
+			"WHEN OLD.ROWID != NEW.ROWID AND "
+			"(NEW.\"%s\" IS NULL OR ST_IsEmpty(NEW.\"%s\"))\n"
+			"BEGIN\n"
+			"DELETE FROM \"rtree_%s_%s\" WHERE id IN (OLD.ROWID, NEW.ROWID);\n"
+			"END`,
+
+		`CREATE TRIGGER \"rtree_%s_%s_delete\"\n"
+			"AFTER DELETE ON \"%s\""
+			"WHEN old.\"%s\" NOT NULL\n"
+			"BEGIN\n" "DELETE FROM \"rtree_%s_%s\" WHERE id = OLD.ROWID;\nEND`,
+	}
+
+	fmt.Println(len(stmts))
+	sql := fmt.Sprintf("CREATE VIRTUAL TABLE rtree_%s_%s USING rtree(id, minx, maxx, miny, maxy)", tabelName, geomColumn)
+	err := g.DB.Exec(sql).Error
+	if err != nil {
+		return errors.Wrap(err, "create rtree index error")
+	}
+	// sql_stmt = sqlite3_mprintf ("INSERT INTO gpkg_extensions "
+	// "(table_name, column_name, extension_name, definition, scope) "
+	// "VALUES (Lower(%Q), Lower(%Q), 'gpkg_rtree_index', "
+	// "'GeoPackage 1.0 Specification Annex L', 'write-only')",
+	// table, column);
+	rtrExt := &Extension{
+		Table:      tabelName,
+		Column:     &geomColumn,
+		Extension:  "gpkg_rtree_index",
+		Definition: "GeoPackage 1.0 Specification Annex L",
+		Scope:      "write-only",
+	}
+	err = g.DB.Save(rtrExt).Error
+	if err != nil {
+		return errors.Wrap(err, "Add gpkg_rtree_index extension error")
+	}
+
+	return nil
+}
+
+//AddGeomColumn geom type will be covert to upper case
+func (g *GeoPackage) AddGeomColumn(tableName, geomColumn, geomType string) error {
+	// /* Add column definition to metadata table */
+	// sql_stmt = sqlite3_mprintf ("INSERT INTO gpkg_geometry_columns "
+	// "(table_name, column_name, geometry_type_name, srs_id, z, m) "
+	// "VALUES (%Q, %Q, %Q, %i, %i, %i)",
+	// table, geometry_column_name, geometry_type_name,
+	// srid, with_z, with_m);
+
+	supportTypes := map[string]bool{
+		"GEOMETRY":        true,
+		"POINT":           true,
+		"LINESTRING":      true,
+		"POLYGON":         true,
+		"MULTIPOINT":      true,
+		"MULTILINESTRING": true,
+		"MULTIPOLYGON":    true,
+		"GEOMCOLLECTION":  true,
+	}
+
+	upperType := strings.ToUpper(geomType)
+	_, ok := supportTypes[upperType]
+	if !ok {
+		return fmt.Errorf("unspported geom type name")
+	}
+
+	geoCol := &GeometryColumn{
+		GeometryColumnTableName:  tableName,
+		ColumnName:               geomColumn,
+		GeometryType:             upperType,
+		SpatialReferenceSystemId: 4326,
+	}
+	err := g.DB.Save(geoCol).Error
+	if err != nil {
+		return errors.Wrap(err, "Add gpkg_geometry_columns error")
+	}
+	return nil
+}
+
+//InitSpatialRefSys ..
+func (g *GeoPackage) InitSpatialRefSys() error {
+	/* GeoPackage Section 1.1.2.1.2 */
+	err := g.DB.Exec("INSERT INTO gpkg_spatial_ref_sys (srs_name, srs_id, organization, organization_coordsys_id, definition) VALUES ('Undefined Cartesian', -1, 'NONE', -1, 'Undefined')").Error
+	if err != nil {
+		return err
+	}
+	err = g.DB.Exec("INSERT INTO gpkg_spatial_ref_sys (srs_name, srs_id, organization, organization_coordsys_id, definition) VALUES ('Undefined Geographic', 0, 'NONE', 0, 'Undefined')").Error
+	if err != nil {
+		return err
+	}
+	err = g.DB.Exec("INSERT INTO gpkg_spatial_ref_sys (srs_name, srs_id, organization, organization_coordsys_id, definition) VALUES ('WGS84', 4326, 'epsg', 4326, 'GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563,AUTHORITY[\"EPSG\",\"7030\"]],AUTHORITY[\"EPSG\",\"6326\"]],PRIMEM[\"Greenwich\",0,AUTHORITY[\"EPSG\",\"8901\"]],UNIT[\"degree\",0.0174532925199433,AUTHORITY[\"EPSG\",\"9122\"]],AUTHORITY[\"EPSG\",\"4326\"]]')").Error
+	if err != nil {
+		return err
+	}
+	return nil
 }
